@@ -1,5 +1,10 @@
 # bevy_simple_text_input
 
+# Fork
+This fork uses [bevy_input_focus](https://docs.rs/bevy/latest/bevy/input_focus/index.html) to only pass keyboard input to the currently focused text input. At the moment the only builtin way to focus a text input is clicking on it but you can also spawn the entity with the `AutoFocus` component, set the `FocusedInput` resource or use the `tab_navigation` / `directional_navigation` modules from `bevy_input_focus`.
+
+Im still concidering if it makes sense to integrate move of these directly into `simple_text_input`.
+
 [![crates.io](https://img.shields.io/crates/v/bevy_simple_text_input.svg)](https://crates.io/crates/bevy_simple_text_input)
 [![docs](https://docs.rs/bevy_simple_text_input/badge.svg)](https://docs.rs/bevy_simple_text_input)
 [![Following released Bevy versions](https://img.shields.io/badge/Bevy%20tracking-released%20version-lightblue)](https://bevyengine.org/learn/book/plugin-development/#main-branch-tracking)
