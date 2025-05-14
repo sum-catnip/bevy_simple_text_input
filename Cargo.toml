@@ -20,7 +20,7 @@ libm = ["bevy/libm"]
 [dependencies.bevy]
 version = "0.16.0"
 default-features = false
-features = ["bevy_ui", "bevy_asset", "bevy_text", "bevy_window"]
+features = ["bevy_ui", "bevy_asset", "bevy_text", "bevy_window", "bevy_ui_picking_backend", "bevy_input_focus"]
 
 [dev-dependencies.bevy]
 version = "0.16.0"
