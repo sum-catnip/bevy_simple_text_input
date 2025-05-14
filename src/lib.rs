@@ -32,8 +32,9 @@
 
 use bevy::{
     asset::{load_internal_binary_asset, weak_handle},
-    ecs::{event::EventCursor, system::SystemParam},
+    ecs::system::SystemParam,
     input::keyboard::{Key, KeyboardInput},
+    input_focus::{FocusedInput, InputDispatchPlugin, InputFocus, IsFocused, IsFocusedHelper},
     prelude::*,
     text::{LineBreak, TextLayoutInfo},
     ui::FocusPolicy,
@@ -56,16 +57,19 @@ impl Plugin for TextInputPlugin {
             |bytes: &[u8], _path: String| { Font::try_from_bytes(bytes.to_vec()).unwrap() }
         );
 
+        if !app.is_plugin_added::<InputDispatchPlugin>() {
+            app.add_plugins(InputDispatchPlugin);
+        }
+
         app.init_resource::<TextInputNavigationBindings>()
             .add_event::<TextInputSubmitEvent>()
             .add_observer(create)
             .add_systems(
                 Update,
                 (
-                    keyboard,
-                    update_value.after(keyboard),
+                    update_value,
                     blink_cursor,
-                    show_hide_cursor,
+                    show_hide_cursor.run_if(resource_changed::<InputFocus>),
                     update_style,
                     update_color,
                     show_hide_placeholder,
@@ -301,142 +305,6 @@ impl InnerText<'_, '_> {
     }
 }
 
-fn keyboard(
-    key_input: Res<ButtonInput<KeyCode>>,
-    input_events: Res<Events<KeyboardInput>>,
-    mut input_reader: Local<EventCursor<KeyboardInput>>,
-    mut text_input_query: Query<(
-        Entity,
-        &TextInputSettings,
-        &TextInputInactive,
-        &mut TextInputValue,
-        &mut TextInputCursorPos,
-        &mut TextInputCursorTimer,
-    )>,
-    mut submit_writer: EventWriter<TextInputSubmitEvent>,
-    navigation: Res<TextInputNavigationBindings>,
-) {
-    if input_reader.clone().read(&input_events).next().is_none() {
-        return;
-    }
-
-    // collect actions that have all required modifiers held
-    let valid_actions = navigation
-        .0
-        .iter()
-        .filter(|(_, TextInputBinding { modifiers, .. })| {
-            modifiers.iter().all(|m| key_input.pressed(*m))
-        })
-        .map(|(action, TextInputBinding { key, .. })| (*key, action));
-
-    for (input_entity, settings, inactive, mut text_input, mut cursor_pos, mut cursor_timer) in
-        &mut text_input_query
-    {
-        if inactive.0 {
-            continue;
-        }
-
-        let mut submitted_value = None;
-
-        for input in input_reader.clone().read(&input_events) {
-            if !input.state.is_pressed() {
-                continue;
-            };
-
-            let pos = cursor_pos.bypass_change_detection().0;
-
-            if let Some((_, action)) = valid_actions
-                .clone()
-                .find(|(key, _)| *key == input.key_code)
-            {
-                use TextInputAction::*;
-                let mut timer_should_reset = true;
-                match action {
-                    CharLeft => cursor_pos.0 = cursor_pos.0.saturating_sub(1),
-                    CharRight => cursor_pos.0 = (cursor_pos.0 + 1).min(text_input.0.len()),
-                    LineStart => cursor_pos.0 = 0,
-                    LineEnd => cursor_pos.0 = text_input.0.len(),
-                    WordLeft => {
-                        cursor_pos.0 = text_input
-                            .0
-                            .char_indices()
-                            .rev()
-                            .skip(text_input.0.len() - cursor_pos.0 + 1)
-                            .skip_while(|c| c.1.is_ascii_whitespace())
-                            .find(|c| c.1.is_ascii_whitespace())
-                            .map(|(ix, _)| ix + 1)
-                            .unwrap_or(0)
-                    }
-                    WordRight => {
-                        cursor_pos.0 = text_input
-                            .0
-                            .char_indices()
-                            .skip(cursor_pos.0)
-                            .skip_while(|c| !c.1.is_ascii_whitespace())
-                            .find(|c| !c.1.is_ascii_whitespace())
-                            .map(|(ix, _)| ix)
-                            .unwrap_or(text_input.0.len())
-                    }
-                    DeletePrev => {
-                        if pos > 0 {
-                            cursor_pos.0 -= 1;
-                            text_input.0 = remove_char_at(&text_input.0, cursor_pos.0);
-                        }
-                    }
-                    DeleteNext => {
-                        if pos < text_input.0.len() {
-                            text_input.0 = remove_char_at(&text_input.0, cursor_pos.0);
-
-                            // Ensure that the cursor isn't reset
-                            cursor_pos.set_changed();
-                        }
-                    }
-                    Submit => {
-                        if settings.retain_on_submit {
-                            submitted_value = Some(text_input.0.clone());
-                        } else {
-                            submitted_value = Some(std::mem::take(&mut text_input.0));
-                            cursor_pos.0 = 0;
-                        };
-                        timer_should_reset = false;
-                    }
-                }
-
-                cursor_timer.should_reset |= timer_should_reset;
-                continue;
-            }
-
-            match input.logical_key {
-                Key::Space => {
-                    let byte_pos = byte_pos(&text_input.0, pos);
-                    text_input.0.insert(byte_pos, ' ');
-                    cursor_pos.0 += 1;
-
-                    cursor_timer.should_reset = true;
-                }
-                Key::Character(ref s) => {
-                    let byte_pos = byte_pos(&text_input.0, pos);
-                    text_input.0.insert_str(byte_pos, s.as_str());
-
-                    cursor_pos.0 += 1;
-
-                    cursor_timer.should_reset = true;
-                }
-                _ => (),
-            }
-        }
-
-        if let Some(value) = submitted_value {
-            submit_writer.write(TextInputSubmitEvent {
-                entity: input_entity,
-                value,
-            });
-        }
-    }
-
-    input_reader.clear(&input_events);
-}
-
 fn update_value(
     mut input_query: Query<
         (
@@ -653,30 +521,155 @@ fn create(
             .add_children(&[overflow_container, placeholder_text]);
 
         // Prevent clicks from registering on UI elements underneath the text input.
-        commands.entity(trigger.target()).insert(FocusPolicy::Block);
+        commands
+            .entity(trigger.target())
+            .insert(FocusPolicy::Block)
+            .observe(keyboard_event)
+            .observe(click_focus);
+
+        // Hook up input dispatch events
     }
+}
+
+fn click_focus(t: Trigger<Pointer<Click>>, mut focused: ResMut<InputFocus>) {
+    focused.set(t.target());
+}
+
+fn keyboard_event(
+    t: Trigger<FocusedInput<KeyboardInput>>,
+    key_input: Res<ButtonInput<KeyCode>>,
+    mut text_input_query: Query<(
+        Entity,
+        &TextInputSettings,
+        &mut TextInputValue,
+        &mut TextInputCursorPos,
+        &mut TextInputCursorTimer,
+    )>,
+    mut submit_writer: EventWriter<TextInputSubmitEvent>,
+    navigation: Res<TextInputNavigationBindings>,
+) -> Result {
+    // collect actions that have all required modifiers held
+    let valid_actions = navigation
+        .0
+        .iter()
+        .filter(|(_, TextInputBinding { modifiers, .. })| {
+            modifiers.iter().all(|m| key_input.pressed(*m))
+        })
+        .map(|(action, TextInputBinding { key, .. })| (*key, action));
+
+    let (input_entity, settings, mut text_input, mut cursor_pos, mut cursor_timer) =
+        text_input_query.get_mut(t.target())?;
+    let mut submitted_value = None;
+
+    let input = &t.input;
+    if !input.state.is_pressed() {
+        return Ok(());
+    };
+
+    let pos = cursor_pos.bypass_change_detection().0;
+
+    if let Some((_, action)) = valid_actions
+        .clone()
+        .find(|(key, _)| *key == input.key_code)
+    {
+        use TextInputAction::*;
+        let mut timer_should_reset = true;
+        match action {
+            CharLeft => cursor_pos.0 = cursor_pos.0.saturating_sub(1),
+            CharRight => cursor_pos.0 = (cursor_pos.0 + 1).min(text_input.0.len()),
+            LineStart => cursor_pos.0 = 0,
+            LineEnd => cursor_pos.0 = text_input.0.len(),
+            WordLeft => {
+                cursor_pos.0 = text_input
+                    .0
+                    .char_indices()
+                    .rev()
+                    .skip(text_input.0.len() - cursor_pos.0 + 1)
+                    .skip_while(|c| c.1.is_ascii_whitespace())
+                    .find(|c| c.1.is_ascii_whitespace())
+                    .map(|(ix, _)| ix + 1)
+                    .unwrap_or(0)
+            }
+            WordRight => {
+                cursor_pos.0 = text_input
+                    .0
+                    .char_indices()
+                    .skip(cursor_pos.0)
+                    .skip_while(|c| !c.1.is_ascii_whitespace())
+                    .find(|c| !c.1.is_ascii_whitespace())
+                    .map(|(ix, _)| ix)
+                    .unwrap_or(text_input.0.len())
+            }
+            DeletePrev => {
+                if pos > 0 {
+                    cursor_pos.0 -= 1;
+                    text_input.0 = remove_char_at(&text_input.0, cursor_pos.0);
+                }
+            }
+            DeleteNext => {
+                if pos < text_input.0.len() {
+                    text_input.0 = remove_char_at(&text_input.0, cursor_pos.0);
+
+                    // Ensure that the cursor isn't reset
+                    cursor_pos.set_changed();
+                }
+            }
+            Submit => {
+                if settings.retain_on_submit {
+                    submitted_value = Some(text_input.0.clone());
+                } else {
+                    submitted_value = Some(std::mem::take(&mut text_input.0));
+                    cursor_pos.0 = 0;
+                };
+                timer_should_reset = false;
+            }
+        }
+
+        cursor_timer.should_reset |= timer_should_reset;
+    }
+
+    match input.logical_key {
+        Key::Space => {
+            let byte_pos = byte_pos(&text_input.0, pos);
+            text_input.0.insert(byte_pos, ' ');
+            cursor_pos.0 += 1;
+
+            cursor_timer.should_reset = true;
+        }
+        Key::Character(ref s) => {
+            let byte_pos = byte_pos(&text_input.0, pos);
+            text_input.0.insert_str(byte_pos, s.as_str());
+
+            cursor_pos.0 += 1;
+
+            cursor_timer.should_reset = true;
+        }
+        _ => (),
+    }
+
+    if let Some(value) = submitted_value {
+        submit_writer.write(TextInputSubmitEvent {
+            entity: input_entity,
+            value,
+        });
+    }
+
+    Ok(())
 }
 
 // Shows or hides the cursor based on the text input's [`TextInputInactive`] property.
 fn show_hide_cursor(
-    mut input_query: Query<
-        (
-            Entity,
-            &TextInputTextColor,
-            &mut TextInputCursorTimer,
-            &TextInputInactive,
-        ),
-        Changed<TextInputInactive>,
-    >,
+    mut input_query: Query<(Entity, &TextInputTextColor, &mut TextInputCursorTimer)>,
+    focused: IsFocusedHelper,
     inner_text: InnerText,
     mut writer: TextUiWriter,
 ) {
-    for (entity, color, mut cursor_timer, inactive) in &mut input_query {
+    for (entity, color, mut cursor_timer) in &mut input_query {
         let Some(inner) = inner_text.inner_entity(entity) else {
             continue;
         };
 
-        *writer.color(inner, 1) = if inactive.0 {
+        *writer.color(inner, 1) = if !focused.is_focused(entity) {
             TextColor(Color::NONE)
         } else {
             color.0
@@ -688,18 +681,14 @@ fn show_hide_cursor(
 
 // Blinks the cursor on a timer.
 fn blink_cursor(
-    mut input_query: Query<(
-        Entity,
-        &TextInputTextColor,
-        &mut TextInputCursorTimer,
-        Ref<TextInputInactive>,
-    )>,
+    mut input_query: Query<(Entity, &TextInputTextColor, &mut TextInputCursorTimer)>,
     inner_text: InnerText,
     mut writer: TextUiWriter,
+    focused: IsFocusedHelper,
     time: Res<Time>,
 ) {
-    for (entity, color, mut cursor_timer, inactive) in &mut input_query {
-        if inactive.0 {
+    for (entity, color, mut cursor_timer) in &mut input_query {
+        if !focused.is_focused(entity) {
             continue;
         }
 
